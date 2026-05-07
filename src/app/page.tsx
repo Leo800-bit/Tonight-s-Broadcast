@@ -2,6 +2,7 @@
 
 import { useEffect, useState, useRef, useCallback } from "react";
 import type { Broadcast } from "@/lib/types";
+import { useTTS } from "@/lib/useTTS";
 
 // ─── 星空粒子组件 ───
 function Stars({ isDayMode }: { isDayMode: boolean }) {
@@ -103,12 +104,17 @@ export default function Home() {
   const [submitting, setSubmitting] = useState(false);
   const [isDayMode, setIsDayMode] = useState(false);
 
+  // TTS
+  const tts = useTTS();
+
   // 播放控制
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentSection, setCurrentSection] = useState(0);
   const [elapsed, setElapsed] = useState(0);
-  const timerRef = useRef<NodeJS.Timeout | null>(null);
   const [hasPlayed, setHasPlayed] = useState(false);
+  const elapsedTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const speakingSectionRef = useRef(0);
+  const broadcastRef = useRef<Broadcast | null>(null);
 
   // 日间/夜间切换
   const toggleDayMode = useCallback(() => {
@@ -200,68 +206,137 @@ export default function Home() {
     }
   }, [message]);
 
-  // 播放控制
-  const resetPlayback = useCallback(() => {
-    if (timerRef.current) {
-      clearInterval(timerRef.current);
-      timerRef.current = null;
-    }
-    setIsPlaying(false);
-    setCurrentSection(0);
-    setElapsed(0);
-    setHasPlayed(false);
-  }, []);
+  // 用 TTS 顺序朗读所有段落
+  const speakAllSections = useCallback((startFrom: number) => {
+    const b = broadcastRef.current;
+    if (!b) return;
 
+    const contents = [
+      b.opening,
+      b.atmosphere,
+      `听众留言：\n「${b.listener_message}」\n\n主播回应：\n${b.reply}`,
+      b.story,
+      b.thought,
+      b.closing,
+    ];
+
+    let idx = startFrom;
+
+    function speakNext() {
+      if (idx >= contents.length) {
+        // 全部播完
+        if (elapsedTimerRef.current) clearInterval(elapsedTimerRef.current);
+        setIsPlaying(false);
+        return;
+      }
+
+      speakingSectionRef.current = idx;
+      setCurrentSection(idx);
+
+      tts.speak(contents[idx], {
+        onEnd: () => {
+          idx++;
+          speakNext();
+        },
+        onError: () => {
+          idx++;
+          speakNext();
+        },
+      });
+    }
+
+    speakNext();
+  }, [tts]);
+
+  // 开始播放
   const startPlayback = useCallback(() => {
-    if (!broadcast) return;
+    const b = broadcastRef.current;
+    if (!b) return;
+
     setIsPlaying(true);
     setHasPlayed(true);
 
-    timerRef.current = setInterval(() => {
+    // 如果是从头开始，重置进度
+    if (elapsed <= 1 || elapsed >= totalDuration - 1) {
+      setElapsed(0);
+      setCurrentSection(0);
+      speakingSectionRef.current = 0;
+    }
+
+    // 从当前段落开始顺序朗读
+    speakAllSections(speakingSectionRef.current);
+
+    // 辅助计时器（仅用于 UI 进度条展示）
+    if (elapsedTimerRef.current) clearInterval(elapsedTimerRef.current);
+    elapsedTimerRef.current = setInterval(() => {
       setElapsed((prev) => {
         const next = prev + 1;
         if (next >= totalDuration) {
-          if (timerRef.current) clearInterval(timerRef.current);
-          setIsPlaying(false);
+          if (elapsedTimerRef.current) clearInterval(elapsedTimerRef.current);
           return totalDuration;
         }
         return next;
       });
     }, 1000);
-  }, [broadcast]);
+  }, [elapsed, speakAllSections]);
 
+  // 暂停/继续
   const togglePlay = useCallback(() => {
     if (isPlaying) {
-      if (timerRef.current) clearInterval(timerRef.current);
+      // 暂停
+      tts.pause();
       setIsPlaying(false);
+      if (elapsedTimerRef.current) clearInterval(elapsedTimerRef.current);
     } else {
-      if (elapsed >= totalDuration) {
-        setElapsed(0);
-        setCurrentSection(0);
-        setHasPlayed(false);
+      // 继续
+      if (tts.isPaused()) {
+        tts.resume();
+        setIsPlaying(true);
+        // 继续计时器
+        if (elapsedTimerRef.current) clearInterval(elapsedTimerRef.current);
+        elapsedTimerRef.current = setInterval(() => {
+          setElapsed((prev) => {
+            const next = prev + 1;
+            if (next >= totalDuration) {
+              if (elapsedTimerRef.current) clearInterval(elapsedTimerRef.current);
+              return totalDuration;
+            }
+            return next;
+          });
+        }, 1000);
+      } else {
+        // 重新开始/继续播放
+        startPlayback();
       }
-      startPlayback();
     }
-  }, [isPlaying, elapsed, startPlayback]);
+  }, [isPlaying, tts, startPlayback]);
 
-  // 根据 elapsed 计算当前段落
+  // 重置播放
+  const resetPlayback = useCallback(() => {
+    tts.stop();
+    if (elapsedTimerRef.current) {
+      clearInterval(elapsedTimerRef.current);
+      elapsedTimerRef.current = null;
+    }
+    setIsPlaying(false);
+    setCurrentSection(0);
+    setElapsed(0);
+    setHasPlayed(false);
+    speakingSectionRef.current = 0;
+  }, [tts]);
+
+  // 同步 broadcastRef
   useEffect(() => {
-    let accumulated = 0;
-    for (let i = 0; i < sectionDurations.length; i++) {
-      if (elapsed < accumulated + sectionDurations[i]) {
-        setCurrentSection(i);
-        return;
-      }
-      accumulated += sectionDurations[i];
-    }
-  }, [elapsed]);
+    broadcastRef.current = broadcast;
+  }, [broadcast]);
 
-  // 清理定时器
+  // 清理
   useEffect(() => {
     return () => {
-      if (timerRef.current) clearInterval(timerRef.current);
+      if (elapsedTimerRef.current) clearInterval(elapsedTimerRef.current);
+      tts.stop();
     };
-  }, []);
+  }, [tts]);
 
   // 格式化时间
   const formatTime = (sec: number) => {
@@ -283,6 +358,17 @@ export default function Home() {
     window.addEventListener("keydown", handleKey);
     return () => window.removeEventListener("keydown", handleKey);
   }, [broadcast, togglePlay]);
+
+  // 获取中文字体列表（用户首次交互时浏览器才允许语音）
+  useEffect(() => {
+    // 预加载语音列表
+    if (typeof window !== 'undefined' && window.speechSynthesis) {
+      window.speechSynthesis.getVoices();
+      window.speechSynthesis.onvoiceschanged = () => {
+        window.speechSynthesis.getVoices();
+      };
+    }
+  }, []);
 
   // ─── 获取当前正在展示的段落内容 ───
   const sectionContents = broadcast
